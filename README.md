@@ -32,3 +32,4 @@ npm run dev
 - `hardhat@^2.22`
 
 **Note:** v5 of OZ will break these contracts. Keep OZ pinned to 4.9.5.
+Will update to OZ v5 when it's released.

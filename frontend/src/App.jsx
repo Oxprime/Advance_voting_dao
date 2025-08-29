@@ -1,391 +1,610 @@
-import React, { useEffect, useState } from 'react'
-import { BrowserProvider, Contract, Interface, parseEther, id } from 'ethers'
-import governorAbi from './abi/AdvancedGovernor.json'
-import tokenAbi from './abi/GovernanceToken.json'
+// src/App.jsx
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  ethers,
+  BrowserProvider,
+  Contract,
+  Interface,
+  id,
+  parseEther,
+} from "ethers";
+import { getContracts, PROPOSAL_STATES } from "./contracts";
+import {GOVERNOR_ABI} from "./contracts";
 
-const GOV_ADDRESS = import.meta.env.VITE_GOV_ADDRESS
-const TOKEN_ADDRESS = import.meta.env.VITE_TOKEN_ADDRESS
+const Card = ({ title, children }) => (
+  <div className="rounded-2xl border border-white/10 bg-white/5 p-5 shadow-xl">
+    <h3 className="mb-3 text-lg font-semibold text-white">{title}</h3>
+    {children}
+  </div>
+);
 
-export default function App(){
-  const [provider, setProvider] = useState(null)
-  const [signer, setSigner] = useState(null)
-  const [addr, setAddr] = useState('')
-  const [desc, setDesc] = useState('Mint 1 GOV to me')
-  const [proposalId, setProposalId] = useState(null)
-  const [proposals, setProposals] = useState([])
-  const [selectedProposal, setSelectedProposal] = useState(null)
+export default function App() {
+  const [provider, setProvider] = useState(null);
+  const [signer, setSigner] = useState(null);
+  const [address, setAddress] = useState("");
+  const [desc, setDesc] = useState("Mint 1 GOV to me");
+  const [lastId, setLastId] = useState("");
+  const [proposals, setProposals] = useState([]);
+  const [isBusy, setIsBusy] = useState(false);
 
-  async function connect(){
-    if(!window.ethereum) return alert('Install MetaMask')
-    const prov = new BrowserProvider(window.ethereum)
-    await prov.send('eth_requestAccounts', [])
-    const s = await prov.getSigner()
-    setProvider(prov); setSigner(s); setAddr(await s.getAddress())
+  const runner = useMemo(() => signer ?? provider, [signer, provider]);
+  const { governor, token, governorAddress, tokenAddress } = useMemo(() => {
+    if (!runner) return {};
+    return getContracts(runner);
+
+
+  }, [runner]);
+console.log("Governor Address from env:", governorAddress);
+console.log("Token Address from env:", tokenAddress);
+
+  async function connect() {
+    if (!window.ethereum) return alert("Install MetaMask");
+    const prov = new BrowserProvider(window.ethereum);
+    await prov.send("eth_requestAccounts", []);
+    const s = await prov.getSigner();
+    setProvider(prov);
+    setSigner(s);
+    setAddress(await s.getAddress());
   }
 
-  const states = [
-    "Pending", "Active", "Canceled", "Defeated",
-    "Succeeded", "Queued", "Expired", "Executed"
-  ];
+// Updated refreshProposals function with better error handling and debugging
 
-  function g(){ 
-    const abi = governorAbi.abi || governorAbi
-    return new Contract(GOV_ADDRESS, abi, signer || provider) 
+// Updated refreshProposals function that avoids ENS resolution
+
+async function refreshProposals() {
+  if (!provider || !governor || !governorAddress) {
+    console.log("Missing provider, governor, or governor address");
+    return;
   }
   
-  function t(){ 
-    const abi = tokenAbi.abi || tokenAbi
-    return new Contract(TOKEN_ADDRESS, abi, signer || provider) 
-  }
+  setIsBusy(true);
+  try {
+    console.log("Refreshing proposals...");
+    console.log("Governor address:", governorAddress);
+    
+    // Use raw log filtering to avoid ENS issues
+    const iface = new ethers.Interface(GOVERNOR_ABI);
+    const eventTopic = iface.getEvent("ProposalCreated").topicHash;
+    
+    console.log("ProposalCreated event topic:", eventTopic);
 
-  async function delegateSelf(){
+    // Get logs directly from provider
+    const logs = await provider.getLogs({
+      address: governorAddress, // Use the address directly
+      topics: [eventTopic],
+      fromBlock: 0,
+      toBlock: "latest"
+    });
+
+    console.log("Found logs:", logs.length);
+    
+    if (logs.length === 0) {
+      console.log("No ProposalCreated events found");
+      setProposals([]);
+      return;
+    }
+
+    // Parse logs manually
+    const parsedEvents = logs.map((log) => {
+      try {
+        return iface.parseLog(log);
+      } catch (error) {
+        console.error("Failed to parse log:", error);
+        return null;
+      }
+    }).filter(Boolean);
+
+    console.log("Parsed events:", parsedEvents);
+
+    // Get proposal states
+    const items = await Promise.all(
+      parsedEvents.map(async (event) => {
+        try {
+          const pid = event.args.proposalId.toString();
+          console.log(`Getting state for proposal ${pid}`);
+          
+          const st = await governor.state(pid);
+          console.log(`Proposal ${pid} state:`, Number(st));
+          
+          return {
+            id: pid,
+            description: event.args.description,
+            state: Number(st),
+          };
+        } catch (error) {
+          console.error(`Failed to get state for proposal:`, error);
+          return null;
+        }
+      })
+    );
+
+    const validItems = items.filter(Boolean);
+    console.log("Valid proposals:", validItems);
+
+    // Sort by newest first (reverse chronological)
+    const sortedItems = validItems.reverse();
+    
+    setProposals(sortedItems);
+    
+    if (sortedItems[0]) {
+      setLastId(sortedItems[0].id);
+      console.log("Set lastId to:", sortedItems[0].id);
+    }
+
+  } catch (error) {
+    console.error("Error in refreshProposals:", error);
+    alert(`Failed to refresh proposals: ${error.message}`);
+  } finally {
+    setIsBusy(false);
+  }
+}
+
+  async function delegateSelf() {
+    if (!token) return;
+    setIsBusy(true);
     try {
-      const tx = await t().delegate(addr)
-      await tx.wait()
-      alert('Delegated')
-      await fetchProposals()
-    } catch (error) {
-      console.error('Delegate error:', error)
-      alert('Delegation failed: ' + error.message)
+      const tx = await token.delegate(address);
+      await tx.wait();
+      alert("Delegated voting power to yourself.");
+    } catch (e) {
+      console.error(e);
+      alert(`Delegation failed: ${e.message ?? e}`);
+    } finally {
+      setIsBusy(false);
     }
   }
 
-  async function propose(){
-    try {
-      const iface = new Interface(['function mint(address to, uint256 amount)'])
-      const calldata = iface.encodeFunctionData('mint', [addr, parseEther('1')])
-      const tx = await g().propose([TOKEN_ADDRESS],[0],[calldata], desc)
-      const rc = await tx.wait()
-      const log = rc.logs.map(l=>g().interface.parseLog(l)).find(e=>e && e.name==='ProposalCreated')
-      setProposalId(log?.args?.proposalId?.toString())
-      alert('Proposed: '+ (log?.args?.proposalId?.toString() || ''))
-      // Refresh proposals after creating new one
-      await fetchProposals()
-    } catch (error) {
-      console.error('Propose error:', error)
-      alert('Proposal failed: ' + error.message)
-    }
+async function proposeMint() {
+  if (!governor) {
+    console.log("No governor contract available");
+    return;
   }
+  
+  setIsBusy(true);
+  
+  try {
+    console.log("Creating proposal with description:", desc);
+    console.log("Token address:", tokenAddress);
+    console.log("User address:", address);
+    
+    const iface = new ethers.Interface(["function mint(address to,uint256 amount)"]);
+    const calldata = iface.encodeFunctionData("mint", [
+      address,
+      ethers.parseEther("1"),
+    ]);
 
-  async function vote(support){
-    try {
-      const tx = await g().castVote(proposalId, support)
-      await tx.wait()
-      alert('Voted')
-      // Refresh proposals after voting
-      await fetchProposals()
-    } catch (error) {
-      console.error('Vote error:', error)
-      alert('Vote failed: ' + error.message)
-    }
-  }
+    console.log("Generated calldata:", calldata);
 
-  async function queue(){
-    if (!proposalId) {
-      alert('Please enter a proposal ID first')
-      return
+    console.log("Submitting proposal...");
+    const tx = await governor.propose(
+      [tokenAddress],
+      [0],
+      [calldata],
+      desc
+    );
+    
+    console.log("Transaction submitted:", tx.hash);
+    console.log("Waiting for confirmation...");
+    
+    const receipt = await tx.wait();
+    console.log("Transaction confirmed!");
+    console.log("Receipt:", receipt);
+    
+    // Check for ProposalCreated event in the receipt
+    const proposalCreatedEvents = receipt.logs.filter(log => {
+      try {
+        const iface = new Interface(governor.interface.fragments);
+        const parsed = iface.parseLog(log);
+        return parsed.name === "ProposalCreated";
+      } catch {
+        return false;
+      }
+    });
+    
+    console.log("ProposalCreated events in receipt:", proposalCreatedEvents);
+    
+    if (proposalCreatedEvents.length > 0) {
+      const iface = new Interface(governor.interface.fragments);
+      const parsed = iface.parseLog(proposalCreatedEvents[0]);
+      console.log("New proposal ID:", parsed.args.proposalId.toString());
     }
     
-    try {
-      // Find the proposal data from our stored proposals
-      const proposal = proposals.find(p => p.id === proposalId);
-      
-      if (!proposal) {
-        alert('Proposal not found in local data. Please refresh proposals or check the ID.');
-        return;
-      }
-      
-      // Check if proposal is in "Succeeded" state before queuing
-      const gov = g()
-      const state = await gov.state(proposalId)
-      const stateNames = ["Pending", "Active", "Canceled", "Defeated", "Succeeded", "Queued", "Expired", "Executed"]
-      
-      if (state !== 4n) { // 4 = Succeeded (use BigInt comparison)
-        alert(`Cannot queue proposal. Current state: ${stateNames[Number(state)]}. Proposal must be in "Succeeded" state.`)
-        return
-      }
-      
-      // Create deep copies of arrays to avoid read-only issues
-      // Ensure values are properly formatted as BigInt
-      const targets = proposal.targets.map(t => t)
-      const values = proposal.values.map(v => {
-        // Handle Proxy objects or functions that can't be directly converted to BigInt
-        if (typeof v === 'function' || (typeof v === 'object' && v !== null)) {
-          // Try to get the actual value
-          try {
-            // If it's a BigNumber or similar, convert it properly
-            if (v.toString && typeof v.toString === 'function') {
-              return BigInt(v.toString())
+    // Wait longer before refreshing
+    console.log("Waiting 5 seconds before refreshing...");
+    setTimeout(async () => {
+      await refreshProposals();
+    }, 5000);
+    
+    alert("Proposal submitted successfully! Check console for details.");
+    
+  } catch (e) {
+    console.error("Proposal failed:", e);
+    console.error("Error details:", e.error || e.reason || e.message);
+    alert(`Proposal failed: ${e.message || e.reason || e}`);
+  } finally {
+    setIsBusy(false);
+  }
+}
+
+// Add this temporary function to your App.jsx to find contract addresses
+
+async function findContractAddresses() {
+  if (!provider) return;
+  
+  try {
+    console.log("=== SEARCHING FOR CONTRACT ADDRESSES ===");
+    
+    // Get current block number
+    const latestBlock = await provider.getBlockNumber();
+    console.log("Latest block:", latestBlock);
+    
+    // Look for recent contract deployments (last 1000 blocks)
+    const fromBlock = Math.max(0, latestBlock - 1000);
+    
+    // Get all transactions from recent blocks to find contract deployments
+    for (let blockNumber = latestBlock; blockNumber >= fromBlock && blockNumber >= latestBlock - 50; blockNumber--) {
+      try {
+        const block = await provider.getBlock(blockNumber);
+        if (block && block.transactions.length > 0) {
+          console.log(`Checking block ${blockNumber} with ${block.transactions.length} transactions`);
+          
+          for (const txHash of block.transactions) {
+            const tx = await provider.getTransaction(txHash);
+            const receipt = await provider.getTransactionReceipt(txHash);
+            
+            // Contract deployment transactions have no 'to' address
+            if (!tx.to && receipt.contractAddress) {
+              console.log(`Found contract deployment at block ${blockNumber}:`);
+              console.log(`  Transaction: ${txHash}`);
+              console.log(`  Contract Address: ${receipt.contractAddress}`);
+              console.log(`  Gas Used: ${receipt.gasUsed.toString()}`);
+              
+              // Try to identify if it's a governor or token by calling a simple function
+              try {
+                const code = await provider.getCode(receipt.contractAddress);
+                if (code !== "0x") {
+                  console.log(`  Contract has code (${code.length} chars)`);
+                  
+                  // Try to call common functions to identify the contract
+                  const testContract = new ethers.Contract(
+                    receipt.contractAddress, 
+                    [
+                      "function name() view returns (string)",
+                      "function symbol() view returns (string)",
+                      "function votingPeriod() view returns (uint256)",
+                      "function proposalThreshold() view returns (uint256)"
+                    ], 
+                    provider
+                  );
+                  
+                  // Test if it's a token
+                  try {
+                    const name = await testContract.name();
+                    const symbol = await testContract.symbol();
+                    console.log(`  ✅ TOKEN CONTRACT: ${name} (${symbol})`);
+                  } catch (e) {
+                    // Not a token, maybe a governor?
+                    try {
+                      const votingPeriod = await testContract.votingPeriod();
+                      const threshold = await testContract.proposalThreshold();
+                      console.log(`  ✅ GOVERNOR CONTRACT: votingPeriod=${votingPeriod}, threshold=${threshold}`);
+                    } catch (e) {
+                      console.log(`  ❓ Unknown contract type`);
+                    }
+                  }
+                }
+              } catch (e) {
+                console.log(`  Error identifying contract: ${e.message}`);
+              }
             }
-            // Fallback to 0n if we can't convert
-            return 0n
-          } catch (e) {
-            // Fallback to 0n if conversion fails
-            return 0n
           }
         }
-        // For primitive values, convert directly
-        return BigInt(v)
-      })
-      const calldatas = proposal.calldatas.map(c => c)
-      
-      // Use keccak256 hash of the description string
-      const descriptionHash = id(proposal.description)
-      
-      console.log('Queueing with data:', {
-        targets: targets,
-        values: values,
-        calldatas: calldatas,
-        description: proposal.description,
-        descriptionHash: descriptionHash
-      })
-      
-      const tx = await gov.queue(
-        targets, 
-        values, 
-        calldatas, 
-        descriptionHash
-      )
-      await tx.wait()
-      alert('Queued successfully!')
-      await fetchProposals()
-    } catch (error) {
-      console.error('Queue error:', error)
-      // Better error handling
-      if (error.reason) {
-        alert('Queue failed: ' + error.reason)
-      } else if (error.data && error.data.message) {
-        alert('Queue failed: ' + error.data.message)
-      } else {
-        alert('Queue failed: ' + error.message)
+      } catch (e) {
+        console.log(`Error checking block ${blockNumber}:`, e.message);
       }
+    }
+    
+    console.log("=== SEARCH COMPLETE ===");
+    
+  } catch (error) {
+    console.error("Error finding addresses:", error);
+  }
+}
+
+
+  async function cast(support) {
+    if (!governor || !lastId) return;
+    setIsBusy(true);
+    try {
+      const tx = await governor.castVote(lastId, support); // 0 against, 1 for, 2 abstain
+      await tx.wait();
+      await refreshProposals();
+      alert("Vote cast.");
+    } catch (e) {
+      console.error(e);
+      alert(`Vote failed: ${e.message ?? e}`);
+    } finally {
+      setIsBusy(false);
     }
   }
 
-  async function execute(){
-    if (!proposalId) {
-      alert('Please enter a proposal ID first')
-      return
+  async function queue() {
+    if (!governor) return;
+    setIsBusy(true);
+    try {
+      const iface = new Interface(["function mint(address to,uint256 amount)"]);
+      const calldata = iface.encodeFunctionData("mint", [
+        address,
+        parseEther("1"),
+      ]);
+      const dh = id(desc);
+      const tx = await governor.queue(
+        [tokenAddress],
+        [0],
+        [calldata],
+        dh
+      );
+      await tx.wait();
+      await refreshProposals();
+      alert("Queued.");
+    } catch (e) {
+      console.error(e);
+      alert(`Queue failed: ${e.message ?? e}`);
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function execute() {
+    if (!governor) return;
+    setIsBusy(true);
+    try {
+      const iface = new Interface(["function mint(address to,uint256 amount)"]);
+      const calldata = iface.encodeFunctionData("mint", [
+        address,
+        parseEther("1"),
+      ]);
+      const dh = id(desc);
+      const tx = await governor.execute(
+        [tokenAddress],
+        [0],
+        [calldata],
+        dh
+      );
+      await tx.wait();
+      await refreshProposals();
+      alert("Executed 🎉");
+    } catch (e) {
+      console.error(e);
+      alert(`Execute failed: ${e.message ?? e}`);
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+
+
+async function testCurrentContracts() {
+  console.log("=== TESTING CURRENT CONTRACTS ===");
+  
+  try {
+    const testGovernorAddr = "0xDc64a140a3E981100a9becA4E685f962f0cf6C9";
+    const testTokenAddr = "0x5FDb235567afecb367f032d93f642f64180aa3";
+    
+    // Try to create contracts without validation
+    const governor = new ethers.Contract(testGovernorAddr, GOVERNOR_ABI, provider);
+    const token = new ethers.Contract(testTokenAddr, TOKEN_ABI, provider);
+    
+    console.log("Contracts created successfully");
+    
+    // Test basic governor functions
+    try {
+      const votingDelay = await governor.votingDelay();
+      console.log("✅ Governor votingDelay:", votingDelay.toString());
+    } catch (e) {
+      console.log("❌ Governor votingDelay failed:", e.message);
     }
     
     try {
-      // Find the proposal data from our stored proposals
-      const proposal = proposals.find(p => p.id === proposalId);
-      
-      if (!proposal) {
-        alert('Proposal not found in local data. Please refresh proposals or check the ID.');
-        return;
-      }
-      
-      // Check if proposal is in "Queued" state and timelock delay has passed
-      const gov = g()
-      const state = await gov.state(proposalId)
-      const stateNames = ["Pending", "Active", "Canceled", "Defeated", "Succeeded", "Queued", "Expired", "Executed"]
-      
-      if (state !== 5n) { // 5 = Queued (use BigInt comparison)
-        alert(`Cannot execute proposal. Current state: ${stateNames[Number(state)]}. Proposal must be in "Queued" state and timelock delay must have passed.`)
-        return
-      }
-      
-      // Create deep copies of arrays to avoid read-only issues
-      // Ensure values are properly formatted as BigInt
-      const targets = proposal.targets.map(t => t)
-      const values = proposal.values.map(v => {
-        // Handle Proxy objects or functions that can't be directly converted to BigInt
-        if (typeof v === 'function' || (typeof v === 'object' && v !== null)) {
-          // Try to get the actual value
-          try {
-            // If it's a BigNumber or similar, convert it properly
-            if (v.toString && typeof v.toString === 'function') {
-              return BigInt(v.toString())
-            }
-            // Fallback to 0n if we can't convert
-            return 0n
-          } catch (e) {
-            // Fallback to 0n if conversion fails
-            return 0n
-          }
-        }
-        // For primitive values, convert directly
-        return BigInt(v)
-      })
-      const calldatas = proposal.calldatas.map(c => c)
-      
-      // Use keccak256 hash of the description string
-      const descriptionHash = id(proposal.description)
-      
-      console.log('Executing with data:', {
-        targets: targets,
-        values: values,
-        calldatas: calldatas,
-        description: proposal.description,
-        descriptionHash: descriptionHash
-      })
-      
-      const tx = await gov.execute(
-        targets, 
-        values, 
-        calldatas, 
-        descriptionHash
-      )
-      await tx.wait()
-      alert('Executed successfully!')
-      await fetchProposals()
-    } catch (error) {
-      console.error('Execute error:', error)
-      // Better error handling
-      if (error.reason) {
-        alert('Execute failed: ' + error.reason)
-      } else if (error.data && error.data.message) {
-        alert('Execute failed: ' + error.data.message)
-      } else {
-        alert('Execute failed: ' + error.message)
-      }
+      const votingPeriod = await governor.votingPeriod();
+      console.log("✅ Governor votingPeriod:", votingPeriod.toString());
+    } catch (e) {
+      console.log("❌ Governor votingPeriod failed:", e.message);
     }
-  }
-
-  async function fetchProposals() {
-    if (!provider) return;
     
+    // Test basic token functions
     try {
-      const gov = g(); // governor contract
-      const filter = {
-        address: GOV_ADDRESS,
-        topics: [gov.interface.getEvent("ProposalCreated").topicHash],
-      };
-
-      const logs = await provider.getLogs({
-        ...filter,
-        fromBlock: 0n,
-        toBlock: "latest",
-      });
-
-      const parsed = logs.map((l) => {
-        const event = gov.interface.parseLog(l);
-        
-        // Handle the event args properly - they might be in different formats
-        const args = event.args;
-        
-        // Extract arrays properly, handling both indexed and named properties
-        const targets = args.targets || args[1] || [];
-        const values = args.values || args[2] || [];
-        const calldatas = args.calldatas || args[3] || [];
-        const description = args.description || args[8] || '';
-        
-        return {
-          id: args.proposalId || args[0],
-          description: description,
-          // Create new arrays from the event data
-          targets: Array.isArray(targets) ? targets.map(t => t) : [targets],
-          values: Array.isArray(values) ? values.map(v => v) : [values],
-          calldatas: Array.isArray(calldatas) ? calldatas.map(c => c) : [calldatas],
-          voteStart: args.voteStart || args[6],
-          voteEnd: args.voteEnd || args[7],
-          blockNumber: l.blockNumber
-        };
-      });
-
-      // Deduplicate proposals by ID
-      const unique = Object.values(
-        parsed.reduce((acc, p) => {
-          acc[p.id.toString()] = p; // dedupe by proposalId string
-          return acc;
-        }, {})
-      );
-
-      // Fetch live state for each proposal
-      const withState = await Promise.all(
-        unique.map(async (p) => {
-          try {
-            const s = await gov.state(p.id); // pass BigInt
-            return { 
-              ...p, 
-              id: p.id.toString(), 
-              state: states[Number(s)] || "Unknown" 
-            };
-          } catch (err) {
-            console.error("State fetch failed for", p.id.toString(), err);
-            return { 
-              ...p, 
-              id: p.id.toString(), 
-              state: "Unknown" 
-            };
-          }
-        })
-      );
-
-      // Sort by most recent first
-      setProposals(withState.reverse());
-    } catch (error) {
-      console.error("Error fetching proposals:", error);
+      const name = await token.name();
+      console.log("✅ Token name:", name);
+    } catch (e) {
+      console.log("❌ Token name failed:", e.message);
     }
+    
+    if (address) {
+      try {
+        const balance = await token.balanceOf(address);
+        console.log("✅ Your token balance:", ethers.formatEther(balance));
+      } catch (e) {
+        console.log("❌ Token balanceOf failed:", e.message);
+      }
+    }
+    
+  } catch (error) {
+    console.error("Error testing contracts:", error);
   }
+}
+// Add this to your JSX - temporary debug button
+// <button onClick={debugContractSetup} className="...">Debug Contracts</button>
 
+  // auto refresh once connected
   useEffect(() => {
-    if (!provider) return;
+    if (provider && governor) refreshProposals();
+  }, [provider, governor]);
 
-    // Fetch immediately
-    fetchProposals();
-
-    // Auto-refresh every 15s
-    const interval = setInterval(fetchProposals, 15000);
-
-    return () => clearInterval(interval); // cleanup on unmount
-  }, [provider]);
+  // UI helpers
+  const canVote = proposals.find((p) => p.id === lastId)?.state === 1;
+  const canQueue = proposals.find((p) => p.id === lastId)?.state === 4;
+  const canExecute = proposals.find((p) => p.id === lastId)?.state === 5;
 
   return (
-    <div style={{ maxWidth: 720, margin: '40px auto', fontFamily: 'sans-serif' }}>
-      <h1>Advanced Governor dApp</h1>
-      {!addr ? <button onClick={connect}>Connect</button> : <p>Connected: {addr}</p>}
-      <hr/>
-      <h3>Delegate</h3>
-      <button onClick={delegateSelf} disabled={!addr}>Delegate votes to self</button>
-      <hr/>
-      <button onClick={fetchProposals}>Refresh Proposals</button>
-      <hr/>
-      <h3>Create Proposal</h3>
-      <input value={desc} onChange={e=>setDesc(e.target.value)} style={{width:'100%'}}/>
-      <button onClick={propose} disabled={!addr}>Propose mint(1 GOV to me)</button>
-      {proposalId && <p>Last proposalId: {proposalId}</p>}
-      <hr/>
-      <h3>Vote</h3>
-      <input 
-        type="text" 
-        placeholder="Enter proposal ID" 
-        value={proposalId || ''} 
-        onChange={e=>setProposalId(e.target.value)}
-        style={{width:'100%', marginBottom:'10px'}}
-      />
-      <button onClick={()=>vote(1)} disabled={!addr || !proposalId}>Vote For</button>
-      <button onClick={()=>vote(0)} disabled={!addr || !proposalId}>Vote Against</button>
-      <button onClick={()=>vote(2)} disabled={!addr || !proposalId}>Abstain</button>
-      <hr/>
-      <h3>Queue & Execute</h3>
-      <p><strong>Instructions:</strong></p>
-      <ul>
-        <li>Queue: Proposal must be in "Succeeded" state (voting passed)</li>
-        <li>Execute: Proposal must be in "Queued" state and timelock delay must have passed</li>
-        <li>Make sure to enter the correct Proposal ID above</li>
-      </ul>
-      <button onClick={queue} disabled={!addr || !proposalId}>Queue</button>
-      <button onClick={execute} disabled={!addr || !proposalId}>Execute</button>
-      <hr/>
-      <h3>Recent Proposals</h3>
-      <ul>
-        {proposals.map((p) => (
-          <li key={p.id} style={{marginBottom: '10px'}}>
-            <div>
-              <code>{p.id}</code> — {p.description} ({p.state})
-            </div>
-            <button 
-              onClick={() => setProposalId(p.id)}
-              style={{marginTop: '5px', fontSize: '12px'}}
+    <div className="min-h-screen bg-gradient-to-br from-[#12022F] to-[#2B0B5E] text-white">
+      {/* Top bar */}
+      <header className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-fuchsia-600/80 shadow">
+            <span className="text-xl">⚙️</span>
+          </div>
+          <h1 className="text-xl font-semibold">Advanced DAO</h1>
+        </div>
+        <button
+          onClick={connect}
+          className="rounded-xl bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/20"
+        >
+          {address ? `${address.slice(0, 6)}…${address.slice(-4)}` : "Connect Wallet"}
+        </button>
+      </header>
+
+      {/* Hero */}
+      <section className="mx-auto max-w-4xl px-6 py-8 text-center">
+        <h2 className="mb-3 text-4xl font-bold">Decentralized Governance</h2>
+        <p className="text-white/70">
+          Delegate votes, create proposals, vote, queue & execute with a timelock.
+        </p>
+      </section>
+
+      {/* Grid */}
+      <main className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 pb-24 md:grid-cols-2">
+        {/* Voting Power */}
+        <Card title="🧑‍🤝‍🧑 Voting Power">
+          <p className="mb-4 text-sm text-white/70">
+            Delegate your voting power to yourself to participate.
+          </p>
+          <button
+            disabled={!address || isBusy}
+            onClick={delegateSelf}
+            className="rounded-xl bg-fuchsia-600 px-4 py-2 text-sm font-semibold hover:bg-fuchsia-500 disabled:opacity-40"
+          >
+            Delegate votes to self
+          </button>
+        </Card>
+
+        {/* Recent Proposals */}
+        <Card title="📰 Recent Proposals">
+          <div className="mb-3 flex items-center gap-3">
+            <button
+              onClick={refreshProposals}
+              disabled={!provider || isBusy}
+              className="rounded-xl bg-white/10 px-3 py-1.5 text-sm hover:bg-white/20 disabled:opacity-40"
             >
-              Use this ID for Queue/Execute
+              Refresh
             </button>
-          </li>
-        ))}
-      </ul>
+            {lastId && (
+              <span className="truncate text-xs text-white/60">
+                Last: <code className="text-white/80">{lastId}</code>
+              </span>
+            )}
+          </div>
+          <ul className="space-y-2">
+            {proposals.map((p) => (
+              <li
+                key={p.id}
+                className="rounded-xl bg-white/5 px-3 py-2 text-sm"
+              >
+                <div className="truncate">
+                  <code className="text-white/80">{p.id}</code> — {p.description}
+                </div>
+                <div className="mt-0.5 text-xs text-white/60">
+                  {PROPOSAL_STATES[p.state] ?? "Unknown"}
+                </div>
+                <button
+                  className="mt-2 rounded-lg bg-white/10 px-2 py-1 text-xs hover:bg-white/20"
+                  onClick={() => setLastId(p.id)}
+                >
+                  Use this ID
+                </button>
+              </li>
+            ))}
+            {!proposals.length && (
+              <li className="text-sm text-white/60">No proposals found.</li>
+            )}
+          </ul>
+        </Card>
+
+        {/* Create Proposal */}
+        <Card title="➕ Create Proposal">
+          <input
+            value={desc}
+            onChange={(e) => setDesc(e.target.value)}
+            className="mb-3 w-full rounded-lg border border-white/10 bg-transparent px-3 py-2 text-sm outline-none placeholder:text-white/40"
+            placeholder="Description"
+          />
+          <button
+            disabled={!address || isBusy}
+            onClick={proposeMint}
+            className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold hover:bg-emerald-500 disabled:opacity-40"
+          >
+            Propose mint(1 GOV to me)
+          </button>
+        </Card>
+
+        {/* Vote / Queue / Execute */}
+        <Card title="🗳️ Vote • ⏳ Queue • ✅ Execute">
+          <div className="mb-3 text-xs text-white/70">
+            Choose a proposal from “Recent Proposals” or use the last created one.
+          </div>
+
+          <div className="mb-4 flex gap-2">
+            <button
+              onClick={() => cast(1)}
+              disabled={!address || !lastId || !canVote || isBusy}
+              className="rounded-lg bg-white/10 px-3 py-1.5 text-sm hover:bg-white/20 disabled:opacity-40"
+            >
+              Vote For
+            </button>
+            <button
+              onClick={() => cast(0)}
+              disabled={!address || !lastId || !canVote || isBusy}
+              className="rounded-lg bg-white/10 px-3 py-1.5 text-sm hover:bg-white/20 disabled:opacity-40"
+            >
+              Vote Against
+            </button>
+            <button
+              onClick={() => cast(2)}
+              disabled={!address || !lastId || !canVote || isBusy}
+              className="rounded-lg bg-white/10 px-3 py-1.5 text-sm hover:bg-white/20 disabled:opacity-40"
+            >
+              Abstain
+            </button>
+<div className="flex gap-2">
+
+
+</div>
+          </div>
+
+          <div className="flex gap-2">
+            <button
+              onClick={queue}
+              disabled={!address || !lastId || !canQueue || isBusy}
+              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-semibold hover:bg-indigo-500 disabled:opacity-40"
+            >
+              Queue
+            </button>
+            <button
+              onClick={execute}
+              disabled={!address || !lastId || !canExecute || isBusy}
+              className="rounded-lg bg-teal-600 px-3 py-1.5 text-sm font-semibold hover:bg-teal-500 disabled:opacity-40"
+            >
+              Execute
+            </button>
+          </div>
+
+          <ul className="mt-4 list-disc space-y-1 pl-5 text-xs text-white/60">
+            <li>Queue requires state = <b>Succeeded</b>.</li>
+            <li>Execute requires state = <b>Queued</b> and timelock passed.</li>
+          </ul>
+        </Card>
+      </main>
     </div>
-  )
+  
+  );
 }
